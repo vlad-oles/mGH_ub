@@ -48,9 +48,8 @@ def conv(H): # H is Hessian
 
 
 # Frank-Wolfe algoritm.
-def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, hess_u_wrt_gamma, dis_XY, P0,
-                      tol=1e-8, max_iter=10, verbose=0, injective=False, step_size='line-search',
-                      check_away_step=False):
+def solve_frank_wolfe(X, Y, u, grad_u, L, argmin_u_wrt_gamma, dis_XY, P0, tol=1e-8, max_iter=10,
+                      verbose=0, injective=False, step_size='line-search', check_away_step=False):
     """
     Minimize u:R^|X|×|Y|🠖R over the mapping polytope 𝒫 ⊂ [0,1]|X|×|Y|.
 
@@ -59,8 +58,7 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, hess_u_wrt_gamma, di
     :param u: objective
     :param grad_u: ∇u
     :param L: Lipschitz constant of ∇u
-    :param grad_u_wrt_gamma:
-    :param hess_u_wrt_gamma:
+    :param argmin_u_wrt_gamma:
     :param dis_XY: function dis:(X🠖Y)🠖R
     :param P0: starting point
     :param tol:
@@ -89,7 +87,7 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, hess_u_wrt_gamma, di
     stopped = False
     for i in range(1, max_iter + 1):
         grad_at_P = grad_u(P)
-        gamma = gamma_max = None
+        gamma_max = 1
 
         # Find the default Frank-Wolfe direction.
         F = find_descent_direction(grad_at_P, injective=injective)
@@ -138,28 +136,16 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, hess_u_wrt_gamma, di
 
         # Find how much to move in the decided direction, γ.
         if step_size == LINE_SEARCH:
-            # Set bounds to [0, 1] if moving in the default Frank-Wolfe direction.
-            if gamma_max is None:
-                gamma_max = 1
-            # res = min((minimize(#!! only start from gamma_max/2 and ensure no difference from gamma0 in [0, gamma_max]
-            #     lambda x: u(P + x * direction), gamma0, bounds=[(0, gamma_max)], jac=lambda x: alpha_jac(x, P, direction))
-            #     for gamma0 in [0, gamma_max]), key=lambda res: res.fun)
-            res = minimize(
-                lambda x: u(P + x * D), gamma_max/2, bounds=[(0, gamma_max)],
-                jac=lambda x: grad_u_wrt_gamma(x, P, D))#, options={'maxls': 50})
-            gamma = res.x[0]
-            assert not np.isnan(gamma) and np.isfinite(gamma), f'Bad γ={gamma} from line-search'
-            # if not res.success:
-            #     raise ValueError(f'Linear optimization failed on [0, {gamma_max:.5f}] '
-            #                      f'(γ={gamma}): {res.message}')
+            # Leverage the fact that u(γ) = a*γ^2 + b*γ + c to minimize it on [0, γ_max].
+            global_argmin = argmin_u_wrt_gamma(P, D)
+            critical_gammas = {0, gamma_max}
+            if 0 < global_argmin < gamma_max:
+                critical_gammas.add(global_argmin)
+            gamma = min(critical_gammas, key=lambda x: u(P + x * D))
+
         elif step_size == CLOSED_LOOP:
             D_norm = la.norm(D, 2)
             gamma = min(gap / L / D_norm, 1)
-            if np.isnan(gamma):#!!
-                np.save('bad_D.npy', D)
-            assert not np.isnan(gamma) and np.isfinite(gamma),\
-                f'Bad γ={gamma} from closed-loop: gap={gap:.5f}, L={L:.2f}, ' \
-                f'‖D‖={D_norm:.5f}, <∞ is {np.isfinite(D).all()}, ∈R: {np.isnan(D).any()}'
         else:
             raise ValueError(f'Unknown step-size strategy {step_size}')
 
@@ -186,8 +172,9 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, hess_u_wrt_gamma, di
             alpha_seq *= 1 + alpha_seq_increase_sign * gamma
             alpha_seq[F_idx] -= alpha_seq_increase_sign * gamma
 
-            assert np.all(alpha_seq >= -1e10),\
-                f'traversed vertex weights are negative: {alpha_seq[alpha_seq < 0]}'
+            assert np.all(alpha_seq >= -1e-10),\
+                f'traversed vertex weights are negative: {alpha_seq}, F_idx={F_idx}' \
+                f', sign={alpha_seq_increase_sign}, gamma={gamma}'
             assert np.allclose(P, np.sum(F_seq * alpha_seq[:, None, None], axis=0)),\
                 f'bad decomposition of P by traversed vertices'
 
@@ -226,129 +213,45 @@ def solve_frank_wolfe_seq(fw_seq, P0):
     return P, iterations
 
 
-def make_frank_wolfe_solver(X, Y, c=2., u_type='c_exp', **kwargs):
+def make_frank_wolfe_solver(X, Y, c=2., **kwargs):
     """
     Create Frank-Wolfe solver for minimizing c-based u:R^|X|×|Y|🠖R over the
     mapping polytope 𝒫 ⊂ [0,1]|X|×|Y|.
 
     :param X:
     :param Y:
-    :param u_type:
     :param c:
     :param kwargs:
     :return: function for solving the minimization
     """
+    # Make auxiliary function that is component to others.
+    def S(P):
+        return c**X @ P @ c**-Y + c**-X @ P @ c**Y
+
     # Make objective u.
-    if u_type == 'sq':  # '‖Δ‖²'
-        def S(P):
-            return -X @ P @ Y
-    elif u_type == 'sq+':  # '‖Δ‖² for non-surj'
-        def S(P):
-            return -X @ P @ Y + .5 * P @ Y @ P.T @ P @ Y
-    elif u_type in {'exp', 'mix', 'mix+'}:  # '‖e^|Δ|‖_1'
-        def S(P):
-            return np.e**X @ P @ np.e**-Y + np.e**-X @ P @ np.e**Y
-    elif u_type == 'sq+exp':  # '‖Δ‖² for non-surj'
-        def S(P):
-            return c**X @ P @ c**-Y + c**-X @ P @ c**Y - X @ P @ Y + .5 * P @ Y @ P.T @ P @ Y
-    elif u_type == 'c_exp':  # '‖c^|Δ|‖_1'
-        #delta = .1  # smallest positive |d_X(x, x') - d_Y(y, y')|
-        #c = (len(X) ** 2 + 1) ** (1 / delta)  # so that argmin ‖c^|Δ|‖_1 = argmin ‖Δ‖_∞
-
-        def S(P):
-            return c**X @ P @ c**-Y + c**-X @ P @ c**Y
-    elif u_type not in {'XP-PY', 'exp_2'}:
-        raise ValueError(f'unknown objective type {u_type}')
-
     def u(P):
-        if u_type == 'XP-PY':  # '‖XP-PY‖²'
-            return np.sum((X @ P - P @ Y)**2)
-        elif u_type == 'exp_2':
-            return np.sum((P * (np.e**X @ P @ np.e**-Y + np.e**-X @ P @ np.e**Y))**2)
-        else:
-            return np.sum(P * S(P))
+        return np.sum(P * S(P))
 
     # Make ∇u.
     def grad_u(P):
-        if u_type == 'XP-PY':  # '‖XP-PY‖²'
-            return 2*(X @ X @ P - 2*X @ P @ Y + P @ Y @ Y)
-        elif u_type == 'sq+':
-            return 2 * (-X @ P @ Y + P @ Y @ P.T @ P @ Y)
-        elif u_type == 'sq+exp':
-            return 2 * (c**X @ P @ c**-Y + c**-X @ P @ c**Y - X @ P @ Y + P @ Y @ P.T @ P @ Y)
-        elif u_type == 'exp_2':
-            T_0 = np.exp(X)
-            T_1 = np.exp(-Y)
-            T_2 = np.exp(-X)
-            T_3 = np.exp(Y)
-            T_4 = (((T_0).dot(P)).dot(T_1) + ((T_2).dot(P)).dot(T_3))
-            T_5 = (P * T_4)
-            T_6 = (T_5 * P)
-            return ((2 * (T_5 * T_4)) + (2 * ((T_0.T).dot(T_6)).dot(T_1.T))) + (2 * ((T_2.T).dot(T_6)).dot(T_3.T))
-        else:
-            return 2 * S(P)
+        return 2 * S(P)
 
     # Calculate Lipschitz constant of ∇u.
-    if u_type == 'c_exp':
-        L = 2*(la.norm(c**(X - Y), 2) + la.norm(c**(Y - X), 2))
-    else:
-        L = None
+    L = 2*(la.norm(c**(X - Y), 2) + la.norm(c**(Y - X), 2))
 
-    def grad_u_wrt_gamma(gamma, P, D):  # D = F - P
-        if u_type == 'XP-PY':  # '‖XP-PY‖²'
-            return 2 * (gamma * np.sum((X @ D - D @ Y) ** 2) + np.sum((X @ D) * (X @ P)) +
-                        np.sum((D @ Y) * (P @ Y)) - np.sum((X @ D) * (P @ Y)) - np.sum((X @ P) * (D @ Y)))
-        elif u_type == 'sq+':
-            # !! MORE EFFICIENT FORMULATION (BUT YIELDS ERROR WHEN CALLING 'minimize()'
-            # P_plus_alpha_D = P + alpha * d
-            # return 2*(np.sum(P_plus_alpha_D * (d @ Y @ P_plus_alpha_D.T @ P_plus_alpha_D @ Y)) -\
-            #           np.sum(P_plus_alpha_D * (X @ d @ Y)))
+    # Make function finding global γ* minimizing quadratic u(γ) = u(P + γD).
+    def argmin_u_wrt_gamma(P, D):
+        # u(γ) = a*γ^2 + b*γ + c.
+        a = np.sum(D * S(D))
+        b = np.sum(D * S(P)) + np.sum(P * S(D))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            argmin_u = -b / (2*a)
 
-            PD = P.T @ D
-            YPPY = Y @ P.T @ P @ Y
-            YPDY = Y @ (PD + PD.T) @ Y
-            YDDY = Y @ D.T @ D @ Y
-            return 2 * gamma ** 3 * np.sum(D * (D @ YDDY)) + \
-                   1.5 * gamma ** 2 * (np.sum(D * (P @ YDDY)) + np.sum(P * (D @ YDDY)) + np.sum(D * (D @ YPDY))) + \
-                   gamma * (np.sum(P * (P @ YDDY)) + np.sum(D * (P @ YPDY)) + np.sum(P * (D @ YPDY)) + np.sum(
-                D * (D @ YPPY))) + \
-                   .5 * (np.sum(P * (P @ YPDY)) + np.sum(D * (P @ YPPY)) + np.sum(P * (D @ YPPY))) + \
-                   np.sum(D * (-X @ P @ Y)) + np.sum(P * (-X @ D @ Y)) + 2 * gamma * np.sum(D * (-X @ D @ Y))
-        # !! make grad_u_wrt_gamma for 'sq+exp' to try it out (sq+ should serve as a regularization)!!
-        elif u_type == 'exp_2':
-            T_0 = (P + (gamma * D))
-            T_1 = np.exp(X)
-            T_2 = np.exp(-Y)
-            T_3 = np.exp(-X)
-            T_4 = np.exp(Y)
-            T_5 = ((T_1).dot((T_0).dot(T_2)) + (T_3).dot((T_0).dot(T_4)))
-            T_6 = (T_0 * T_5)
-            T_7 = (T_6 * T_0)
-            return np.array([((2 * np.trace((D).dot((T_6 * T_5).T))) + (
-                        2 * np.trace((((T_7.T).dot(T_1)).dot(D)).dot(T_2)))) + (
-                                    2 * np.trace((((T_7.T).dot(T_3)).dot(D)).dot(T_4)))])
-
-        else:
-            return np.sum(D * S(P)) + np.sum(P * S(D)) + 2 * gamma * np.sum(D * S(D))
-
-    def hess_u_wrt_gamma(gamma, P, D):  # D = F - P
-        if u_type == 'XP-PY':  # '‖XP-PY‖²'
-            return 2 * np.sum((X @ D - D @ Y)**2)
-        elif u_type == 'sq+':
-            PD = P.T @ D
-            YPPY = Y @ P.T @ P @ Y
-            YPDY = Y @ (PD + PD.T) @ Y
-            YDDY = Y @ D.T @ D @ Y
-            return 6 * gamma ** 2 * np.sum(D * (D @ YDDY)) + \
-                   3 * gamma * (np.sum(D * (P @ YDDY)) + np.sum(P * (D @ YDDY)) + np.sum(D * (D @ YPDY))) + \
-                   np.sum(P * (P @ YDDY)) + np.sum(D * (P @ YPDY)) + np.sum(P * (D @ YPDY)) + np.sum(D * (D @ YPPY)) + \
-                   2 * np.sum(D * (-X @ D @ Y))
-        else:
-            return 2 * np.sum(D * S(D))
+        return argmin_u
 
     dis_XY = partial(dis, X=X, Y=Y)
     fw = partial(solve_frank_wolfe, len(X), len(Y), u, grad_u, L,
-                 grad_u_wrt_gamma, hess_u_wrt_gamma, dis_XY, **kwargs)
+                 argmin_u_wrt_gamma, dis_XY, **kwargs)
 
     return fw
 
@@ -385,8 +288,8 @@ def find_min_dis(X, Y, c_seq=2., n_restarts=1, center_start=True, max_iter=10, v
     if max_iter == 'log':
         max_iter = int(np.ceil(np.log(max(n, m))))
 
-    fw_seq = [make_frank_wolfe_solver(X, Y, u_type='c_exp', c=c, max_iter=max_iter,
-                                      injective=injective, verbose=verbose, **kwargs)
+    fw_seq = [make_frank_wolfe_solver(X, Y, c=c, max_iter=max_iter, injective=injective,
+                                      verbose=verbose, **kwargs)
         for c in c_seq]
 
     min_dis = np.inf
