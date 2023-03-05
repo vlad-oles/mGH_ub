@@ -160,9 +160,9 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, argmin_u_wrt_gamma, dis_XY, P0, tol=1e
         assert np.allclose(np.sum(P + P_increase, axis=1), 1), \
             f'next P is not row-stochastic: γ={gamma}, D={repr(D)}, prev P={repr(P)}'
 
-        if verbose > 0:# or not res.success:
+        if verbose > 0:
             print(f'iter {i}: dis(P)={dis_XY(P):.3f}, dis(Proj P)={dis_XY(F)}, u(P)={u(P):.2f}'
-                  f'{proj_P_desc}, {direction_point_desc}, γ={gamma:.5f}', '' if res.success else '(FAILURE)')
+                  f'{proj_P_desc}, {direction_point_desc}, γ={gamma:.5f}')
 
         # Take the step from P.
         P += P_increase
