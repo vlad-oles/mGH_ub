@@ -1,9 +1,10 @@
 import numpy as np
+import warnings
 from functools import partial
 import scipy.linalg as la
-from scipy.optimize import minimize, linear_sum_assignment, LinearConstraint, Bounds
+from scipy.optimize import minimize, linear_sum_assignment, check_grad
 
-from constants import SEED
+from constants import *
 from tools import dis, rnd_P, central_P, f_to_F, P_to_f, project_P, card
 
 
@@ -47,8 +48,9 @@ def conv(H): # H is Hessian
 
 
 # Frank-Wolfe algoritm.
-def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, dis_XY, P0, tol=1e-8, max_iter=10,
-                      verbose=0, injective=False, step_size='line-search', check_away_step=False):
+def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, hess_u_wrt_gamma, dis_XY, P0,
+                      tol=1e-8, max_iter=10, verbose=0, injective=False, step_size='line-search',
+                      check_away_step=False):
     """
     Minimize u:R^|X|×|Y|🠖R over the mapping polytope 𝒫 ⊂ [0,1]|X|×|Y|.
 
@@ -58,14 +60,15 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, dis_XY, P0, tol=1e-8
     :param grad_u: ∇u
     :param L: Lipschitz constant of ∇u
     :param grad_u_wrt_gamma:
+    :param hess_u_wrt_gamma:
     :param dis_XY: function dis:(X🠖Y)🠖R
     :param P0: starting point
     :param tol:
     :param max_iter: maximum number of iterations
     :param verbose: how much information to print, 0–2
     :param injective: whether to constraint 𝒫 to injective mappings only, bool
-    :param step_size: 'line-search' or 'closed-loop, see
-        https://hal.science/hal-03579585/document
+    :param step_size: how to calculate gamma, 'line-search' or 'closed-loop'
+        (https://hal.science/hal-03579585/document)
     :param check_away_step: whether to check stepping away from traversed
         vertices for better descent, bool
     :return: solution, number of iterations
@@ -83,22 +86,16 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, dis_XY, P0, tol=1e-8
         alpha_seq[0] = 1
 
     # On each iteration of Frank-Wolfe algorithm...
+    stopped = False
     for i in range(1, max_iter + 1):
         grad_at_P = grad_u(P)
-        gamma = None
+        gamma = gamma_max = None
 
         # Find the default Frank-Wolfe direction.
         F = find_descent_direction(grad_at_P, injective=injective)
         D = F - P
         direction_point, direction_point_desc = F, '(to) F'
         gap = np.sum(-grad_at_P * D) # rate of decrease in chosen direction
-        if step_size == 'line-search':
-            gamma_max = 1
-        elif step_size == 'closed-loop':
-            assert L is not None, 'Lipschitz constant for ∇u is not given'
-            gamma = min(gap / L / la.norm(D, 2), 1)
-        else:
-            raise ValueError(f'unknown step-size strategy {step_size}')
 
         if check_away_step:
             # Find the away direction.
@@ -110,17 +107,19 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, dis_XY, P0, tol=1e-8
 
             # Choose the away direction if it has a steeper decrease in u
             # than the default Frank-Wolfe direction.
-            if gap_away > gap:
+            if alpha_seq[F_idx] < 1 and gap_away > gap:
+                gamma_max = alpha_seq[F_idx] / (1 - alpha_seq[F_idx])
+
                 D = D_away
                 direction_point, direction_point_desc = F_seq[F_idx], '(from) S'
                 gap = gap_away
-                gamma_max = alpha_seq[F_idx] / (1 - alpha_seq[F_idx])
 
                 alpha_seq_increase_sign = 1
             else:
                 # Update P decomposition with newly traversed vertex otherwise.
                 F_seq[i] = F
                 F_idx = i
+
                 alpha_seq_increase_sign = -1
 
         if verbose > 0:
@@ -132,30 +131,48 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, dis_XY, P0, tol=1e-8
             else:
                 proj_P_desc = ''
 
-        # Find how much to move in the decided direction.
-        if gamma is None:
+        # Check if the rate of decrease is too small to proceed.
+        if gap < tol:
+            stopped = True
+            break
+
+        # Find how much to move in the decided direction, γ.
+        if step_size == LINE_SEARCH:
+            # Set bounds to [0, 1] if moving in the default Frank-Wolfe direction.
+            if gamma_max is None:
+                gamma_max = 1
             # res = min((minimize(#!! only start from gamma_max/2 and ensure no difference from gamma0 in [0, gamma_max]
             #     lambda x: u(P + x * direction), gamma0, bounds=[(0, gamma_max)], jac=lambda x: alpha_jac(x, P, direction))
             #     for gamma0 in [0, gamma_max]), key=lambda res: res.fun)
             res = minimize(
                 lambda x: u(P + x * D), gamma_max/2, bounds=[(0, gamma_max)],
-                jac=lambda x: grad_u_wrt_gamma(x, P, D))
+                jac=lambda x: grad_u_wrt_gamma(x, P, D))#, options={'maxls': 50})
             gamma = res.x[0]
+            assert not np.isnan(gamma) and np.isfinite(gamma), f'Bad γ={gamma} from line-search'
+            # if not res.success:
+            #     raise ValueError(f'Linear optimization failed on [0, {gamma_max:.5f}] '
+            #                      f'(γ={gamma}): {res.message}')
+        elif step_size == CLOSED_LOOP:
+            D_norm = la.norm(D, 2)
+            gamma = min(gap / L / D_norm, 1)
+            if np.isnan(gamma):#!!
+                np.save('bad_D.npy', D)
+            assert not np.isnan(gamma) and np.isfinite(gamma),\
+                f'Bad γ={gamma} from closed-loop: gap={gap:.5f}, L={L:.2f}, ' \
+                f'‖D‖={D_norm:.5f}, <∞ is {np.isfinite(D).all()}, ∈R: {np.isnan(D).any()}'
+        else:
+            raise ValueError(f'Unknown step-size strategy {step_size}')
 
         # Calculate the step from P.
         P_increase = gamma * D
 
-        # Check if the rate of decrease is too small to proceed.
-        if gap < tol:
-            if verbose > 0:
-                print('-' * 10 + f'STOP: {direction_point_desc}, γ={gamma:.5f}, '
-                                 f'‖∇u(P)‖²={la.norm(grad_at_P, 2):.2f}, '
-                                 f'‖γD‖²={la.norm(P_increase, 2):.2f}',
-                      '' if res.success else '(FAILURE)')
+        # Stop if the linear minimization doesn't go anywhere.
+        if np.isclose(gamma, 0):
+            stopped = True
             break
 
         assert np.allclose(np.sum(P + P_increase, axis=1), 1), \
-            f'next P is not row-stochastic: γ={gamma}, D={D}, prev P={P}'
+            f'next P is not row-stochastic: γ={gamma}, D={repr(D)}, prev P={repr(P)}'
 
         if verbose > 0:# or not res.success:
             print(f'iter {i}: dis(P)={dis_XY(P):.3f}, dis(Proj P)={dis_XY(F)}, u(P)={u(P):.2f}'
@@ -166,7 +183,7 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, dis_XY, P0, tol=1e-8
 
         # Update decomposition of P based on traversed vertices of 𝒫.
         if check_away_step:
-            alpha_seq += alpha_seq_increase_sign * gamma
+            alpha_seq *= 1 + alpha_seq_increase_sign * gamma
             alpha_seq[F_idx] -= alpha_seq_increase_sign * gamma
 
             assert np.all(alpha_seq >= -1e10),\
@@ -175,22 +192,26 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, grad_u_wrt_gamma, dis_XY, P0, tol=1e-8
                 f'bad decomposition of P by traversed vertices'
 
     if verbose > 0:
-        print('-' * 10 + f'FINAL dis(P)={dis_XY(P):.3f}, dis(Proj P)={dis_XY(F)}, '
-                         f'u(P)={u(P):.2f}{proj_P_desc}')
+        if stopped:
+            print('-'*10 + f'STOPPED: {direction_point_desc}, γ={gamma:.5f}, '
+                           f'‖∇u(P)‖²={la.norm(grad_at_P, 2):.2f}, '
+                           f'‖γD‖²={la.norm(P_increase, 2):.2f}')
+
+        print('-'*10 + f'FINAL dis(P)={dis_XY(P):.3f}, dis(Proj P)={dis_XY(F)}, '
+                       f'u(P)={u(P):.2f}{proj_P_desc}')
         if check_away_step:
             print(alpha_seq[alpha_seq > 0])
 
     return P, i - 1
 
 
-def solve_frank_wolfe_seq(fw_seq, P0, **kwargs):
+def solve_frank_wolfe_seq(fw_seq, P0):
     """
     Solve a sequence of minimization problems using each solution as
     a subsequent starting point.
 
     :param fw_seq: Frank-Wolfe algorithms for solving each minimization
     :param P0: starting point for the first minimization in the sequence
-    :param kwargs: common parameters of the Frank-Wolfe algorithms
     :return: solution, number of iterations in each problem
     """
     if type(fw_seq) is not list:
@@ -199,7 +220,7 @@ def solve_frank_wolfe_seq(fw_seq, P0, **kwargs):
     P = P0
     iterations = []
     for fw in fw_seq:
-        P, i = fw(P0=P, **kwargs)
+        P, i = fw(P0=P)
         iterations.append(i)
 
     return P, iterations
@@ -310,30 +331,30 @@ def make_frank_wolfe_solver(X, Y, c=2., u_type='c_exp', **kwargs):
         else:
             return np.sum(D * S(P)) + np.sum(P * S(D)) + 2 * gamma * np.sum(D * S(D))
 
-    # def alpha_hess(alpha, P, d):  # d is dQP = Q - P
-    #     if obj_type == 'XP-PY':  # '‖XP-PY‖²'
-    #         return 2 * np.sum((X @ d - d @ Y)**2)
-    #     elif obj_type == 'sq+':
-    #         PD = P.T @ d
-    #         YPPY = Y @ P.T @ P @ Y
-    #         YPDY = Y @ (PD + PD.T) @ Y
-    #         YDDY = Y @ d.T @ d @ Y
-    #         return 6 * alpha ** 2 * np.sum(d * (d @ YDDY)) + \
-    #                3 * alpha * (np.sum(d * (P @ YDDY)) + np.sum(P * (d @ YDDY)) + np.sum(d * (d @ YPDY))) + \
-    #                np.sum(P * (P @ YDDY)) + np.sum(d * (P @ YPDY)) + np.sum(P * (d @ YPDY)) + np.sum(d * (d @ YPPY)) + \
-    #                2 * np.sum(d * (-X @ d @ Y))
-    #     else:
-    #         return 2 * np.sum(d * S(d))
+    def hess_u_wrt_gamma(gamma, P, D):  # D = F - P
+        if u_type == 'XP-PY':  # '‖XP-PY‖²'
+            return 2 * np.sum((X @ D - D @ Y)**2)
+        elif u_type == 'sq+':
+            PD = P.T @ D
+            YPPY = Y @ P.T @ P @ Y
+            YPDY = Y @ (PD + PD.T) @ Y
+            YDDY = Y @ D.T @ D @ Y
+            return 6 * gamma ** 2 * np.sum(D * (D @ YDDY)) + \
+                   3 * gamma * (np.sum(D * (P @ YDDY)) + np.sum(P * (D @ YDDY)) + np.sum(D * (D @ YPDY))) + \
+                   np.sum(P * (P @ YDDY)) + np.sum(D * (P @ YPDY)) + np.sum(P * (D @ YPDY)) + np.sum(D * (D @ YPPY)) + \
+                   2 * np.sum(D * (-X @ D @ Y))
+        else:
+            return 2 * np.sum(D * S(D))
 
     dis_XY = partial(dis, X=X, Y=Y)
     fw = partial(solve_frank_wolfe, len(X), len(Y), u, grad_u, L,
-                 grad_u_wrt_gamma, dis_XY, **kwargs)
+                 grad_u_wrt_gamma, hess_u_wrt_gamma, dis_XY, **kwargs)
 
     return fw
 
 
 def find_min_dis(X, Y, c_seq=2., n_restarts=1, center_start=True, max_iter=10, verbose=0,
-                 injective=False, rnd=None):
+                 injective=False, rnd=None, **kwargs):
     """
     Find minimum dis(f) for f:X🠖Y.
 
@@ -364,13 +385,13 @@ def find_min_dis(X, Y, c_seq=2., n_restarts=1, center_start=True, max_iter=10, v
     if max_iter == 'log':
         max_iter = int(np.ceil(np.log(max(n, m))))
 
-    fw_seq = [make_frank_wolfe_solver(X, Y, u_type='c_exp', c=c)
-              for c in c_seq]
+    fw_seq = [make_frank_wolfe_solver(X, Y, u_type='c_exp', c=c, max_iter=max_iter,
+                                      injective=injective, verbose=verbose, **kwargs)
+        for c in c_seq]
 
     min_dis = np.inf
     for P0 in P0s:
-        P, _ = solve_frank_wolfe_seq(fw_seq, P0, max_iter=max_iter,
-                                  injective=injective, verbose=verbose)
+        P, _ = solve_frank_wolfe_seq(fw_seq, P0)
         f = P_to_f(P)
         dis_f = dis(f, X, Y)
 

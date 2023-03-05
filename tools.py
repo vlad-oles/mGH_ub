@@ -1,4 +1,5 @@
 from itertools import permutations, product
+from functools import partial
 from fractions import Fraction
 import numpy as np
 import scipy.sparse as sps
@@ -12,25 +13,34 @@ from constants import *
 
 # ===== GENERATING METRIC SPACES =====
 
-def rnd_graph(n, p, enforce_n=False, rnd=None):
+def gen_graph(n, graph_type=ERDOS, enforce_n=False, rnd=None, **kwargs):
     """
-    Generate adjacency and distance matrices of Erdos-Renyi graph with (up to) n vertices.
+    Generate adjacency and distance matrices of a random graph with (up to) n vertices.
     """
     rnd = rnd or np.random.RandomState(SEED)
 
+    if graph_type == ERDOS:
+        gen_G = partial(nx.erdos_renyi_graph, n=n, p=kwargs['p'], seed=rnd)
+    elif graph_type == WATTS:
+        gen_G = partial(nx.watts_strogatz_graph, n=n, k=2*kwargs['k'], p=kwargs['p'], seed=rnd)
+    elif graph_type == BARABASI:
+        gen_G = partial(nx.barabasi_albert_graph, n=n, m=kwargs['m'], seed=rnd)
+    else:
+        raise ValueError(f'Unknown graph type {graph_type}')
+
     while True:
-        G = nx.erdos_renyi_graph(n, p, seed=rnd)
-        max_conn_comp = list(max(nx.connected_components(G), key=len))
-        if len(max_conn_comp) == n or not enforce_n:
-            A = nx.to_numpy_array(G)[np.ix_(max_conn_comp, max_conn_comp)]
+        G = gen_G()
+        largest_connected_comp = list(max(nx.connected_components(G), key=len))
+        if len(largest_connected_comp) == n or not enforce_n:
+            A = nx.to_numpy_array(G)[np.ix_(largest_connected_comp, largest_connected_comp)]
             break
 
     X = sps.csgraph.shortest_path(A, directed=False, unweighted=True)
 
-    return A, X
+    return X
 
 
-def rnd_point_cloud(n, metric='euclidean', rnd=None):
+def gen_point_cloud(n, metric='euclidean', rnd=None):
     """
     Generates distance matrix of n points in R^(n-1).
     """
@@ -83,6 +93,10 @@ def check_triangle(X, ultra=False, verbose=True):
     return True
 
 
+def card(X):
+    return X if isinstance(X, int) else len(X)
+
+
 def diam(X):
     return X.max()
 
@@ -91,10 +105,98 @@ def rad(X):
     return np.min(X.max(axis=0))
 
 
-def card(X):
-    return X if isinstance(X, int) else len(X)
+def permute(X, rnd=None):
+    """
+    Permutes the order of points in X.
+
+    :param X: distance matrix of X
+    :param rnd: NumPy random state
+    :return: distance matrix of permuted X, 2d-array
+    """
+    rnd = rnd or np.random.RandomState(SEED)
+
+    f = rnd.permutation(card(X))
+    permuted_X = X[np.ix_(f, f)]
+
+    return permuted_X
 
 # ===== MAPPINGS =====
+
+def gen_fs(X, Y, injective=False):
+    """
+    Generates all possible mappings in X🠖Y.
+
+    :param X: distance matrix of X or |X|
+    :param Y: distance matrix of Y or |Y|
+    :param injective: whether the mappings should be injective
+    :return: f:X🠖Y, 1d-array
+    """
+    n, m = card(X), card(Y)
+    for f in (permutations(range(m), n) if injective else product(range(m), repeat=n)):
+        yield np.array(f)
+
+
+def gen_Fs(X, Y, injective=False):
+    """
+    Generates all possible mappings in X🠖Y as {0,1}^|X|×|Y|.
+
+    :param X: distance matrix of X or |X|
+    :param Y: distance matrix of Y or |Y|
+    :param injective: whether the mappings should be injective
+    :return: F, 2d-array
+    """
+    for f in gen_fs(X, Y, injective=injective):
+        yield f_to_F(f)
+
+
+def rnd_f(X, Y, injective=False, rnd=None):
+    """
+    Generates random mapping in X🠖Y.
+
+    :param X: distance matrix of X or |X|
+    :param Y: distance matrix of Y or |Y|
+    :param injective: whether the mappings should be injective
+    :param rnd: NumPy random state
+    :return: mapping, 1d-array
+    """
+    rnd = rnd or np.random.RandomState(SEED)
+
+    n, m = card(X), card(Y)
+    f = rnd.choice(m, n, replace=not injective)
+
+    return f
+
+
+def rnd_P(X, Y, rnd=None):
+    """
+    Generates random soft mapping in X🠖Y as a point in the mapping polytope 𝒫 ⊂ [0,1]|X|×|Y|.
+
+    :param X: distance matrix of X or |X|
+    :param Y: distance matrix of Y or |Y|
+    :param rnd: NumPy random state
+    :return: soft mapping, 2d-array
+    """
+    rnd = rnd or np.random.RandomState(SEED)
+
+    P = rnd.rand(card(X), card(Y))
+    P /= P.sum(axis=1)[:, None]
+
+    return P
+
+
+def central_P(X, Y):
+    """
+    Returns soft mapping that is the barycenter of the mapping polytope 𝒫 ⊂ [0,1]|X|×|Y|.
+
+    :param X: distance matrix of X or |X|
+    :param Y: distance matrix of Y or |Y|
+    :return: soft mapping, 2d-array
+    """
+    n, m = card(X), card(Y)
+    P = np.full((n, m), 1 / m)
+
+    return P
+
 
 def f_to_F(f, Y):
     """
@@ -154,62 +256,6 @@ def l2dis(P, X, Y):
     sq_l2dis_P = ((X - P @ Y @ P.T)**2).sum()
 
     return sq_l2dis_P
-
-
-def gen_fs(X, Y, injective=False):
-    """
-    Generates all possible mappings in X🠖Y.
-
-    :param X: distance matrix of X or |X|
-    :param Y: distance matrix of Y or |Y|
-    :return: f:X🠖Y, 1D array
-    """
-    n, m = card(X), card(Y)
-    for f in (permutations(range(m), n) if injective else product(range(m), repeat=n)):
-        yield np.array(f)
-
-
-def gen_Fs(X, Y, injective=False):
-    """
-    Generates all possible mappings in X🠖Y as {0,1}^|X|×|Y|.
-
-    :param X: distance matrix of X or |X|
-    :param Y: distance matrix of Y or |Y|
-    :return: F, 2D array
-    """
-    for f in gen_fs(X, Y, injective=injective):
-        yield f_to_F(f)
-
-
-def rnd_P(X, Y, rnd=None):
-    """
-    Generates random soft mapping in X🠖Y.
-
-    :param X: distance matrix of X or |X|
-    :param Y: distance matrix of Y or |Y|
-    :param rnd: NumPy random state
-    :return: row-stochastic matrix in [0,1]^|X|×|Y|
-    """
-    rnd = rnd or np.random.RandomState(SEED)
-
-    P = rnd.rand(card(X), card(Y))
-    P /= P.sum(axis=1)[:, None]
-
-    return P
-
-
-def central_P(X, Y):
-    """
-    Returns barycenter of the mapping polytope 𝒫 ⊂ [0,1]|X|×|Y|.
-
-    :param X: distance matrix of X or |X|
-    :param Y: distance matrix of Y or |Y|
-    :return:
-    """
-    n, m = card(X), card(Y)
-    P = np.full((n, m), 1 / m)
-
-    return P
 
 
 def f_g_to_R(f, g):
