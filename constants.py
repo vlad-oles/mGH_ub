@@ -33,7 +33,7 @@ EXP_COLS = [XY_TYPE_COL, XY_SIZE_COL, XY_PARAMS_COL, N_RESTARTS_COL, MAX_ITER_CO
             CENTER_START_COL, STEP_SIZE_COL, AWAY_STEP_COL, N_XYS_COL, TEST_TYPE_COL, VERSION_COL]
 PERF_COLS = ['exact_mean', 'error_mean', 'rel_error_mean', 'time_mean', 'exact_std',
              'error_std', 'rel_error_std', 'time_std']
-ALL_COLS_ORDERED = PERF_COLS[:4] + EXP_COLS + PERF_COLS[4:]
+ALL_COLS_ORDERED = PERF_COLS[:4] + EXP_COLS + [VERSION_DESCR_COL] + PERF_COLS[4:]
 
 # Versions.
 MIN_DIS_VERSIONS = {
