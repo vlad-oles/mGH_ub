@@ -84,9 +84,7 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, argmin_u_wrt_gamma, dis_XY, P0, tol=1e
         alpha_seq[0] = 1
 
     # On each iteration of Frank-Wolfe algorithm...
-    stopped = False
     for i in range(1, max_iter + 1):
-        u_at_P = u(P)
         grad_u_at_P = grad_u(P)
         gamma_max = 1
 
@@ -153,7 +151,6 @@ def solve_frank_wolfe(X, Y, u, grad_u, L, argmin_u_wrt_gamma, dis_XY, P0, tol=1e
 
         # Stop if the rate of decrease is too small or if minimization wrt γ doesn't go anywhere.
         if gap < tol or np.isclose(gamma, 0):
-            stopped = True
             break
 
         assert np.allclose(np.sum(P + P_increase, axis=1), 1), \
@@ -279,20 +276,22 @@ def find_min_dis(X, Y, c_seq=2., n_restarts=1, center_start=True, max_iter=10, v
     if center_start:
         P0s[0] = central_P(n, m)
 
-    # Calculate maximum number of Frank-Wolfe iterations.
+    # Calculate maximum total number of Frank-Wolfe iterations.
     if max_iter == 'log':
         max_iter = int(np.ceil(np.log(max(n, m))))
 
-    # Distribute max_iter across c_seq.
-    small_c_iter, n_big_c_iter = divmod(max_iter, len(c_seq))
-    n_small_c_iter = len(c_seq) - n_big_c_iter
-    big_c_iter = small_c_iter + 1
-    c_iters = [small_c_iter] * n_small_c_iter + [big_c_iter] * n_big_c_iter
+    # If maximum iterations not specified for each c, distribute them evenly.
+    if type(max_iter) is int:
+        # Distribute max_iter across c_seq.
+        small_c_iter, n_big_c_iter = divmod(max_iter, len(c_seq))
+        n_small_c_iter = len(c_seq) - n_big_c_iter
+        big_c_iter = small_c_iter + 1
+        max_iter = [small_c_iter] * n_small_c_iter + [big_c_iter] * n_big_c_iter
 
     # Set up sequence FW of solvers.
     fw_seq = [make_frank_wolfe_solver(X, Y, c=c, max_iter=c_iter, injective=injective,
                                       verbose=verbose, **kwargs)
-        for c, c_iter in zip(c_seq, c_iters)]
+        for c, c_iter in zip(c_seq, max_iter)]
 
     # Solve the sequence using solutions as subsequent starting points.
     min_dis = np.inf
@@ -304,6 +303,9 @@ def find_min_dis(X, Y, c_seq=2., n_restarts=1, center_start=True, max_iter=10, v
         if dis_f < min_dis:
             best_f = f
             min_dis = dis_f
+
+        if verbose > 0:
+            print('-' * 20 + f' dis(F)={dis_f:.2f}, min dis={min_dis:.2f}')
 
     return min_dis, best_f
 

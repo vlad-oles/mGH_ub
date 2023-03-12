@@ -125,7 +125,7 @@ for (test_type, n_XYs, XY_type, XY_params, XY_size), (Xs, Ys, target_distortions
                away_step, n_XYs, test_type, MIN_DIS_VERSION)
 
         # Skip experiment if its conditions are not compatible.
-        if (step_size == CLOSED_LOOP and away_step) or (center_start and n_restarts > 1):
+        if (step_size == CLOSED_LOOP and away_step):
             continue
 
         n_experiments += 1
